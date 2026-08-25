@@ -1391,7 +1391,9 @@ func TestSessionSendMsgPriorityClassification(t *testing.T) {
 	}{
 		{name: "small data stays ordered", threshold: threshold, hdr: encode(typeData, 0, 1, 0), bodyLength: int(threshold), wantQueue: "normal"},
 		{name: "large data", threshold: threshold, hdr: encode(typeData, 0, 2, 0), bodyLength: int(threshold) + 1, wantQueue: "normal"},
-		{name: "control frame", threshold: threshold, hdr: encode(typeWindowUpdate, 0, 3, 0), wantQueue: "priority"},
+		{name: "window update", threshold: threshold, hdr: encode(typeWindowUpdate, 0, 3, 0), wantQueue: "priority"},
+		{name: "stream FIN stays ordered", threshold: threshold, hdr: encode(typeWindowUpdate, flagFIN, 3, 0), wantQueue: "normal"},
+		{name: "GOAWAY stays ordered", threshold: threshold, hdr: encode(typeGoAway, 0, 0, 0), wantQueue: "normal"},
 		{name: "disabled", threshold: 0, hdr: encode(typeData, 0, 4, 0), bodyLength: 1, wantQueue: "normal"},
 	}
 

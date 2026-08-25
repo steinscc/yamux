@@ -90,9 +90,9 @@ type Session struct {
 	// sendCh is used to send messages
 	sendCh chan []byte
 
-	// priorityCh carries protocol control frames when priority scheduling is
-	// enabled. Stream data remains FIFO on sendCh so frames for one byte stream
-	// can never be reordered by size.
+	// priorityCh carries stream window updates when priority scheduling is
+	// enabled. Stream data and terminators remain FIFO on sendCh so frames for
+	// one byte stream can never be reordered.
 	priorityCh chan []byte
 
 	// pingCh and pingCh are used to send pings and pongs
@@ -527,7 +527,7 @@ func (s *Session) sendMsg(hdr header, body []byte, deadline <-chan struct{}, wai
 	copy(buf[headerSize:], body)
 
 	queue := s.sendCh
-	if s.config.PriorityMessageSize > 0 && hdr.MsgType() != typeData {
+	if s.config.PriorityMessageSize > 0 && hdr.MsgType() == typeWindowUpdate && hdr.Flags()&flagFIN == 0 {
 		queue = s.priorityCh
 	}
 
