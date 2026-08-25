@@ -90,6 +90,12 @@ type Session struct {
 	// sendCh is used to send messages
 	sendCh chan []byte
 
+	// priorityCh carries small data messages and protocol control frames when
+	// priority scheduling is enabled. It is deliberately separate from sendCh
+	// so a small control message can be admitted while bulk data fills the
+	// normal queue.
+	priorityCh chan []byte
+
 	// pingCh and pingCh are used to send pings and pongs
 	pongCh, pingCh chan uint32
 
@@ -140,6 +146,7 @@ func newSession(config *Config, conn net.Conn, client bool, readBuf int, newMemo
 		synCh:            make(chan struct{}, config.AcceptBacklog),
 		acceptCh:         make(chan *Stream, config.AcceptBacklog),
 		sendCh:           make(chan []byte, 64),
+		priorityCh:       make(chan []byte, 64),
 		pongCh:           make(chan uint32, config.PingBacklog),
 		pingCh:           make(chan uint32),
 		recvDoneCh:       make(chan struct{}),
@@ -520,6 +527,12 @@ func (s *Session) sendMsg(hdr header, body []byte, deadline <-chan struct{}, wai
 	copy(buf[:headerSize], hdr[:])
 	copy(buf[headerSize:], body)
 
+	queue := s.sendCh
+	if s.config.PriorityMessageSize > 0 &&
+		(hdr.MsgType() != typeData || uint32(len(body)) <= s.config.PriorityMessageSize) {
+		queue = s.priorityCh
+	}
+
 	select {
 	case <-s.shutdownCh:
 		poolPut(buf)
@@ -531,7 +544,7 @@ func (s *Session) sendMsg(hdr header, body []byte, deadline <-chan struct{}, wai
 			return s.shutdownErr
 		}
 		return errSendLoopDone
-	case s.sendCh <- buf:
+	case queue <- buf:
 		return nil
 	case <-deadline:
 		poolPut(buf)
@@ -589,6 +602,8 @@ func (s *Session) sendLoop() (err error) {
 	}
 
 	writer := s.conn
+	priorityBurst := 0
+	priorityEnabled := s.config.PriorityMessageSize > 0
 
 	// FIXME: https://github.com/libp2p/go-libp2p/issues/644
 	// Write coalescing is disabled for now.
@@ -629,42 +644,80 @@ func (s *Session) sendLoop() (err error) {
 			hdr := encode(typePing, flagACK, 0, pingID)
 			copy(buf, hdr[:])
 		default:
-			// Then send normal data.
-			select {
-			case buf = <-s.sendCh:
-			case pingID := <-s.pingCh:
-				buf = poolGet(headerSize)
-				hdr := encode(typePing, flagSYN, 0, pingID)
-				copy(buf, hdr[:])
-			case pingID := <-s.pongCh:
-				buf = poolGet(headerSize)
-				hdr := encode(typePing, flagACK, 0, pingID)
-				copy(buf, hdr[:])
-			case <-s.shutdownCh:
-				return nil
-				// default:
-				//	select {
-				//	case buf = <-s.sendCh:
-				//	case <-s.shutdownCh:
-				//		return nil
-				//	case <-writeTimeoutCh:
-				//		if err := writer.Flush(); err != nil {
-				//			if os.IsTimeout(err) {
-				//				err = ErrConnectionWriteTimeout
-				//			}
-				//			return err
-				//		}
+			// Once eight priority messages have been sent, give an already queued
+			// normal message one turn. This bounds priority latency without
+			// allowing a sustained control-frame burst to starve bulk data.
+			if priorityEnabled && priorityBurst >= 8 {
+				select {
+				case pingID := <-s.pingCh:
+					buf = poolGet(headerSize)
+					hdr := encode(typePing, flagSYN, 0, pingID)
+					copy(buf, hdr[:])
+				case pingID := <-s.pongCh:
+					buf = poolGet(headerSize)
+					hdr := encode(typePing, flagACK, 0, pingID)
+					copy(buf, hdr[:])
+				default:
+					select {
+					case buf = <-s.sendCh:
+						priorityBurst = 0
+					default:
+						priorityBurst = 0
+					}
+				}
+			}
 
-				//		select {
-				//		case buf = <-s.sendCh:
-				//		case <-s.shutdownCh:
-				//			return nil
-				//		}
+			if buf == nil && priorityEnabled {
+				select {
+				case buf = <-s.priorityCh:
+					priorityBurst++
+				default:
+				}
+			}
 
-				//		if writeTimeout != nil {
-				//			writeTimeout.Reset(s.config.WriteCoalesceDelay)
-				//		}
-				//	}
+			if buf == nil {
+				// Then send queued priority or normal data. Ping/Pong remain
+				// available in this blocking select so they retain precedence when
+				// the sender is otherwise idle.
+				select {
+				case buf = <-s.priorityCh:
+					priorityBurst++
+				case buf = <-s.sendCh:
+					priorityBurst = 0
+				case pingID := <-s.pingCh:
+					buf = poolGet(headerSize)
+					hdr := encode(typePing, flagSYN, 0, pingID)
+					copy(buf, hdr[:])
+				case pingID := <-s.pongCh:
+					buf = poolGet(headerSize)
+					hdr := encode(typePing, flagACK, 0, pingID)
+					copy(buf, hdr[:])
+				case <-s.shutdownCh:
+					return nil
+					// default:
+					//	select {
+					//	case buf = <-s.sendCh:
+					//	case <-s.shutdownCh:
+					//		return nil
+					//	case <-writeTimeoutCh:
+					//		if err := writer.Flush(); err != nil {
+					//			if os.IsTimeout(err) {
+					//				err = ErrConnectionWriteTimeout
+					//			}
+					//			return err
+					//		}
+
+					//		select {
+					//		case buf = <-s.sendCh:
+					//		case <-s.shutdownCh:
+					//			return nil
+					//		}
+
+					//		if writeTimeout != nil {
+					//			writeTimeout.Reset(s.config.WriteCoalesceDelay)
+					//		}
+					//	}
+				}
 			}
 		}
 

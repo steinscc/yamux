@@ -1370,6 +1370,136 @@ func TestSession_sendMsg_Timeout(t *testing.T) {
 	}
 }
 
+func newPriorityQueueTestSession(priorityMessageSize uint32) *Session {
+	return &Session{
+		config: &Config{PriorityMessageSize: priorityMessageSize},
+		sendCh: make(chan []byte, 64), priorityCh: make(chan []byte, 64),
+		pingCh: make(chan uint32), pongCh: make(chan uint32, 1),
+		shutdownCh: make(chan struct{}), sendDoneCh: make(chan struct{}),
+	}
+}
+
+func TestSessionSendMsgPriorityClassification(t *testing.T) {
+	const threshold = uint32(8)
+
+	tests := []struct {
+		name       string
+		threshold  uint32
+		hdr        header
+		bodyLength int
+		wantQueue  string
+	}{
+		{name: "small data", threshold: threshold, hdr: encode(typeData, 0, 1, 0), bodyLength: int(threshold), wantQueue: "priority"},
+		{name: "large data", threshold: threshold, hdr: encode(typeData, 0, 2, 0), bodyLength: int(threshold) + 1, wantQueue: "normal"},
+		{name: "control frame", threshold: threshold, hdr: encode(typeWindowUpdate, 0, 3, 0), wantQueue: "priority"},
+		{name: "disabled", threshold: 0, hdr: encode(typeData, 0, 4, 0), bodyLength: 1, wantQueue: "normal"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := newPriorityQueueTestSession(tt.threshold)
+			body := make([]byte, tt.bodyLength)
+			if err := s.sendMsg(tt.hdr, body, nil, true); err != nil {
+				t.Fatalf("sendMsg: %v", err)
+			}
+
+			var got []byte
+			switch tt.wantQueue {
+			case "priority":
+				got = <-s.priorityCh
+				if len(s.sendCh) != 0 {
+					t.Fatal("priority message was also queued as normal")
+				}
+			case "normal":
+				got = <-s.sendCh
+				if len(s.priorityCh) != 0 {
+					t.Fatal("normal message was queued as priority")
+				}
+			}
+			poolPut(got)
+		})
+	}
+}
+
+type sendLoopRecorder struct {
+	mu       sync.Mutex
+	streamID []uint32
+	shutdown chan struct{}
+	close    sync.Once
+}
+
+func (r *sendLoopRecorder) Read([]byte) (int, error) { return 0, io.EOF }
+
+func (r *sendLoopRecorder) Write(data []byte) (int, error) {
+	if len(data) < headerSize {
+		return 0, io.ErrShortBuffer
+	}
+	var hdr header
+	copy(hdr[:], data[:headerSize])
+	r.mu.Lock()
+	r.streamID = append(r.streamID, hdr.StreamID())
+	count := len(r.streamID)
+	r.mu.Unlock()
+	if count == 11 {
+		r.close.Do(func() { close(r.shutdown) })
+	}
+	return len(data), nil
+}
+
+func (r *sendLoopRecorder) Close() error {
+	r.close.Do(func() { close(r.shutdown) })
+	return nil
+}
+
+func (r *sendLoopRecorder) LocalAddr() net.Addr              { return testAddr("local") }
+func (r *sendLoopRecorder) RemoteAddr() net.Addr             { return testAddr("remote") }
+func (r *sendLoopRecorder) SetDeadline(time.Time) error      { return nil }
+func (r *sendLoopRecorder) SetReadDeadline(time.Time) error  { return nil }
+func (r *sendLoopRecorder) SetWriteDeadline(time.Time) error { return nil }
+
+type testAddr string
+
+func (a testAddr) Network() string { return "test" }
+func (a testAddr) String() string  { return string(a) }
+
+func queuedDataFrame(streamID uint32) []byte {
+	hdr := encode(typeData, 0, streamID, 1)
+	return append(hdr[:], byte(streamID))
+}
+
+func TestSessionPrioritySendLoopFairness(t *testing.T) {
+	shutdown := make(chan struct{})
+	recorder := &sendLoopRecorder{shutdown: shutdown}
+	s := newPriorityQueueTestSession(8)
+	s.config.ConnectionWriteTimeout = time.Second
+	s.conn = recorder
+	s.shutdownCh = shutdown
+
+	for streamID := uint32(1); streamID <= 10; streamID++ {
+		s.priorityCh <- queuedDataFrame(streamID)
+	}
+	s.sendCh <- queuedDataFrame(100)
+
+	done := make(chan error, 1)
+	go func() { done <- s.sendLoop() }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("sendLoop: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("sendLoop did not drain the deterministic queue")
+	}
+
+	recorder.mu.Lock()
+	got := append([]uint32(nil), recorder.streamID...)
+	recorder.mu.Unlock()
+	want := []uint32{1, 2, 3, 4, 5, 6, 7, 8, 100, 9, 10}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("send order: got %v, want %v", got, want)
+	}
+}
+
 func TestWindowOverflow(t *testing.T) {
 	// Ensures:
 	//

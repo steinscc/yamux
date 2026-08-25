@@ -63,6 +63,12 @@ type Config struct {
 	// MaxMessageSize is the maximum size of a message that we'll send on a
 	// stream. This ensures that a single stream doesn't hog a connection.
 	MaxMessageSize uint32
+
+	// PriorityMessageSize enables the priority send queue for small messages.
+	// A value of zero disables the queue and preserves the default FIFO
+	// scheduling. Data messages with a body no larger than this value, as well
+	// as non-data control messages, are sent through the priority queue.
+	PriorityMessageSize uint32
 }
 
 // DefaultConfig is used to return a default configuration
