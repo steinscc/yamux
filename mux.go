@@ -64,10 +64,11 @@ type Config struct {
 	// stream. This ensures that a single stream doesn't hog a connection.
 	MaxMessageSize uint32
 
-	// PriorityMessageSize enables the priority send queue for small messages.
-	// A value of zero disables the queue and preserves the default FIFO
-	// scheduling. Data messages with a body no larger than this value, as well
-	// as non-data control messages, are sent through the priority queue.
+	// PriorityMessageSize enables the priority send queue for protocol control
+	// messages. A value of zero disables the queue and preserves the default
+	// FIFO scheduling. Data messages always stay on the FIFO data queue: moving
+	// a later small data frame ahead of an earlier large frame corrupts the
+	// ordered byte stream.
 	PriorityMessageSize uint32
 }
 

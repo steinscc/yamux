@@ -1389,7 +1389,7 @@ func TestSessionSendMsgPriorityClassification(t *testing.T) {
 		bodyLength int
 		wantQueue  string
 	}{
-		{name: "small data", threshold: threshold, hdr: encode(typeData, 0, 1, 0), bodyLength: int(threshold), wantQueue: "priority"},
+		{name: "small data stays ordered", threshold: threshold, hdr: encode(typeData, 0, 1, 0), bodyLength: int(threshold), wantQueue: "normal"},
 		{name: "large data", threshold: threshold, hdr: encode(typeData, 0, 2, 0), bodyLength: int(threshold) + 1, wantQueue: "normal"},
 		{name: "control frame", threshold: threshold, hdr: encode(typeWindowUpdate, 0, 3, 0), wantQueue: "priority"},
 		{name: "disabled", threshold: 0, hdr: encode(typeData, 0, 4, 0), bodyLength: 1, wantQueue: "normal"},
@@ -1418,6 +1418,75 @@ func TestSessionSendMsgPriorityClassification(t *testing.T) {
 			}
 			poolPut(got)
 		})
+	}
+}
+
+type shortWriteRecorder struct {
+	mu       sync.Mutex
+	data     []byte
+	writes   int
+	expected int
+	shutdown chan struct{}
+	close    sync.Once
+}
+
+func (r *shortWriteRecorder) Read([]byte) (int, error) { return 0, io.EOF }
+
+func (r *shortWriteRecorder) Write(data []byte) (int, error) {
+	n := 3
+	if len(data) < n {
+		n = len(data)
+	}
+	r.mu.Lock()
+	r.data = append(r.data, data[:n]...)
+	r.writes++
+	done := len(r.data) == r.expected
+	r.mu.Unlock()
+	if done {
+		r.close.Do(func() { close(r.shutdown) })
+	}
+	return n, nil
+}
+
+func (r *shortWriteRecorder) Close() error {
+	r.close.Do(func() { close(r.shutdown) })
+	return nil
+}
+
+func (r *shortWriteRecorder) LocalAddr() net.Addr              { return testAddr("local") }
+func (r *shortWriteRecorder) RemoteAddr() net.Addr             { return testAddr("remote") }
+func (r *shortWriteRecorder) SetDeadline(time.Time) error      { return nil }
+func (r *shortWriteRecorder) SetReadDeadline(time.Time) error  { return nil }
+func (r *shortWriteRecorder) SetWriteDeadline(time.Time) error { return nil }
+
+func TestSessionSendLoopCompletesShortWrites(t *testing.T) {
+	frame := queuedDataFrame(7)
+	shutdown := make(chan struct{})
+	recorder := &shortWriteRecorder{expected: len(frame), shutdown: shutdown}
+	s := newPriorityQueueTestSession(8)
+	s.config.ConnectionWriteTimeout = time.Second
+	s.conn = recorder
+	s.shutdownCh = shutdown
+	queued := poolGet(len(frame))
+	copy(queued, frame)
+	s.sendCh <- queued
+
+	done := make(chan error, 1)
+	go func() { done <- s.sendLoop() }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("sendLoop: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("sendLoop did not finish the short writes")
+	}
+	recorder.mu.Lock()
+	got := append([]byte(nil), recorder.data...)
+	writes := recorder.writes
+	recorder.mu.Unlock()
+	if !bytes.Equal(got, frame) || writes <= 1 {
+		t.Fatalf("short writes: got=%x want=%x writes=%d", got, frame, writes)
 	}
 }
 
